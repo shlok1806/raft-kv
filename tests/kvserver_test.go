@@ -3,6 +3,7 @@ package tests
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 	"github.com/shlok1806/raft-kv/kvserver"
 	"github.com/shlok1806/raft-kv/raft"
 )
+
+var globalClientId int64
 
 // kvCluster extends the basic raft cluster with KV servers layered on top.
 // The KV servers own the applyCh goroutine so we rebuild the nodes here
@@ -105,12 +108,18 @@ func (kvc *kvCluster) reconnect(i int) {
 func (kvc *kvCluster) findLeader(timeout time.Duration) int {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		kvc.mu.Lock()
 		for i, rf := range kvc.nodes {
+			if kvc.disconn[i] {
+				continue
+			}
 			_, ok := rf.GetState()
 			if ok {
+				kvc.mu.Unlock()
 				return i
 			}
 		}
+		kvc.mu.Unlock()
 		time.Sleep(15 * time.Millisecond)
 	}
 	kvc.t.Fatalf("no leader elected within %v", timeout)
@@ -135,7 +144,7 @@ type inProcessClient struct {
 }
 
 func newInProcessClient(kvc *kvCluster) *inProcessClient {
-	return &inProcessClient{kvc: kvc, clientId: time.Now().UnixNano()}
+	return &inProcessClient{kvc: kvc, clientId: atomic.AddInt64(&globalClientId, 1)}
 }
 
 func (c *inProcessClient) nextReq() int64 {

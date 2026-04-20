@@ -107,12 +107,18 @@ func (cl *cluster) reconnect(i int) {
 func (cl *cluster) findLeader(timeout time.Duration) int {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		cl.mu.Lock()
 		for i, rf := range cl.nodes {
+			if cl.disconn[i] {
+				continue
+			}
 			_, ok := rf.GetState()
 			if ok {
+				cl.mu.Unlock()
 				return i
 			}
 		}
+		cl.mu.Unlock()
 		time.Sleep(15 * time.Millisecond)
 	}
 	cl.t.Fatalf("no leader elected within %v", timeout)
@@ -120,8 +126,13 @@ func (cl *cluster) findLeader(timeout time.Duration) int {
 }
 
 func (cl *cluster) leaderCount() int {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
 	n := 0
-	for _, rf := range cl.nodes {
+	for i, rf := range cl.nodes {
+		if cl.disconn[i] {
+			continue
+		}
 		_, ok := rf.GetState()
 		if ok {
 			n++
@@ -249,7 +260,9 @@ func TestNetworkPartition(t *testing.T) {
 }
 
 func TestTermMonotonicity(t *testing.T) {
-	cl := newCluster(t, 3)
+	// 5-node cluster so we can kill 2 consecutive leaders and still have
+	// a quorum of 3 for the third election
+	cl := newCluster(t, 5)
 	defer cl.cleanup()
 
 	prevTerm := 0
@@ -261,6 +274,6 @@ func TestTermMonotonicity(t *testing.T) {
 		}
 		prevTerm = term
 		cl.disconnect(l)
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
