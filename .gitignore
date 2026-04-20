@@ -1,0 +1,5 @@
+data/
+*.tmp
+/raft-kv
+/server
+/client
