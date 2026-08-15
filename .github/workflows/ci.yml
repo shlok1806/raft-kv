@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Vet, build, test with race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test with race detector
+        # -race is not optional for a consensus implementation: most of the
+        # interesting failure modes here are concurrency bugs, and they are
+        # invisible without it.
+        run: go test ./... -race -count=1 -timeout 10m
+
+  flake-guard:
+    # TestNetworkPartition previously failed ~60% of runs because the harness
+    # submitted commands to a partitioned-off leader, whose log could never
+    # reach quorum. A single green run would not have caught that. These tests
+    # are the non-deterministic ones, so they are repeated.
+    name: Partition and chaos tests are not flaky
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Repeat the non-deterministic tests
+        run: |
+          go test ./tests/ -race -count=5 -timeout 15m \
+            -run 'TestNetworkPartition|TestReelection|TestLeaderCrashMidWrite|TestChaos'
+
+  e2e:
+    name: Five-node cluster serves reads and writes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+
+      - name: Build binaries
+        run: |
+          go build -o bin/server ./cmd/server
+          go build -o bin/client ./cmd/client
+
+      - name: Start a 5-node cluster, exercise it, then kill 2 nodes
+        # The unit tests dispatch RPCs as direct method calls. This is the only
+        # job that proves the real binaries talk to each other over TCP.
+        run: |
+          set -euo pipefail
+          PEERS=localhost:8000,localhost:8001,localhost:8002,localhost:8003,localhost:8004
+          for i in 0 1 2 3 4; do
+            ./bin/server -id $i -peers $PEERS -data /tmp/rkdata > /tmp/node$i.log 2>&1 &
+          done
+
+          for i in $(seq 1 30); do
+            if ./bin/client -peers $PEERS put warmup ok >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          ./bin/client -peers $PEERS put city chicago
+          got=$(./bin/client -peers $PEERS get city)
+          [ "$got" = "chicago" ] || { echo "::error::get returned '$got', want 'chicago'"; exit 1; }
+
+          ./bin/client -peers $PEERS delete city
+          got=$(./bin/client -peers $PEERS get city)
+          [ "$got" = "(not found)" ] || { echo "::error::after delete got '$got'"; exit 1; }
+
+          # A 5-node cluster must tolerate 2 failures.
+          ./bin/client -peers $PEERS put survive yes
+          pkill -f "bin/server -id 0" || true
+          pkill -f "bin/server -id 1" || true
+          sleep 5
+
+          got=$(./bin/client -peers $PEERS get survive)
+          [ "$got" = "yes" ] || { echo "::error::lost data after 2 of 5 nodes died: '$got'"; exit 1; }
+
+          ./bin/client -peers $PEERS put after-failover ok
+          got=$(./bin/client -peers $PEERS get after-failover)
+          [ "$got" = "ok" ] || { echo "::error::cannot write after failover: '$got'"; exit 1; }
+
+          echo "5-node cluster survived 2 failures with reads and writes intact."
+
+      - name: Node logs on failure
+        if: failure()
+        run: tail -n 50 /tmp/node*.log

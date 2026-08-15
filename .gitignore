@@ -3,3 +3,4 @@ data/
 /raft-kv
 /server
 /client
+bin/

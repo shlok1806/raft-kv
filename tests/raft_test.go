@@ -141,9 +141,31 @@ func (cl *cluster) leaderCount() int {
 	return n
 }
 
+// submitToLeader finds the current leader among the *connected* nodes and
+// submits cmd to it.
+//
+// Skipping disconnected nodes is not cosmetic. A partitioned-off leader does
+// not step down in Raft - it keeps believing it is leader until it observes a
+// higher term - so its Start() still reports ok. Submitting there appends to a
+// log that can never reach quorum, and the caller then waits forever for a
+// commit that cannot happen. That made TestNetworkPartition fail roughly 60% of
+// the time, decided purely by whether the stale leader's index sorted before
+// the new leader's. findLeader and leaderCount already filter this way.
 func (cl *cluster) submitToLeader(cmd interface{}) (int, int) {
 	for {
-		for _, rf := range cl.nodes {
+		// Collect under the lock, then call Start outside it: Start can trigger
+		// sendRPC, which takes cl.mu itself.
+		cl.mu.Lock()
+		connected := make([]*raft.Raft, 0, len(cl.nodes))
+		for i, rf := range cl.nodes {
+			if cl.disconn[i] {
+				continue
+			}
+			connected = append(connected, rf)
+		}
+		cl.mu.Unlock()
+
+		for _, rf := range connected {
 			idx, term, ok := rf.Start(cmd)
 			if ok {
 				return idx, term
